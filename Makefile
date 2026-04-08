@@ -1,8 +1,9 @@
 NVCC        := nvcc
 NVCCFLAGS   := -std=c++14 -O2 -arch=native
 
-GPUTK_DIR   ?= /usr/local
-INCLUDES    := -I$(GPUTK_DIR)/include
+GPUTK_DIR   := ./libgputk
+LIBS        := -L$(GPUTK_DIR) -lgputk -Xlinker -rpath -Xlinker $(shell pwd)/libgputk
+INCLUDES    := -I$(GPUTK_DIR)
 LIBS        := -L$(GPUTK_DIR)/lib -lgputk
 
 SRC_DIR     := src

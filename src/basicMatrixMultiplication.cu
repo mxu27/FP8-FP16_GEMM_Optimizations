@@ -108,9 +108,9 @@ int main(int argc, char **argv) {
   gpuTKCheck(cudaFree(deviceC));
 
   gpuTKTime_stop(GPU, "Freeing GPU Memory");
-
+  
   gpuTKSolution(args, hostC, numCRows, numCColumns);
-
+  
   free(hostA);
   free(hostB);
   free(hostC);
