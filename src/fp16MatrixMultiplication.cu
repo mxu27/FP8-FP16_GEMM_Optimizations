@@ -14,6 +14,7 @@
   } while (0)
 
 // Converts array from FP32 values to FP16 values, writing into a buffer with stride dstCols.
+//Takes array A in FP32 and converts it to FP16
 // Out-of-bounds positions in dst are left as zero (caller must cudaMemset).
 __global__ void convertAndPadFP32ToFP16(
     const float* src, half* dst,
