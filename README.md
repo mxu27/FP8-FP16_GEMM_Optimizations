@@ -82,6 +82,16 @@ Large dataset:
 ./build/compareMatrixMultiplication -i data/13/input0.raw,data/13/input1.raw -o /tmp/out.raw -t matrix
 ```
 
+### Naive FP8 GEMM (`fp8MatrixMultiplication`)
+
+FP8 GEMM comparing both E4M3 and E5M2 formats with two quantization strategies (per-tensor and per-row/per-column scaling). Runs all four variants and prints accuracy vs the FP32 reference.
+
+```bash
+./build/fp8MatrixMultiplication -i data/1/input0.raw,data/1/input1.raw -e data/1/output.raw -o /tmp/out.raw -t matrix
+```
+
+---
+
 ## Source Files
 
 | File | Description |
@@ -89,4 +99,6 @@ Large dataset:
 | `src/basicMatrixMultiplication.cu` | FP32 naive GEMM baseline |
 | `src/fp16MatrixMultiplication.cu` | Naive FP16 GEMM (`__hmul`/`__hadd`, FP32 output) |
 | `src/fp16WMMAMatrixMultiplication.cu` | FP16 WMMA Tensor Core GEMM |
-| `src/compareMatrixMultiplication.cu` | Runs all three kernels, prints accuracy vs FP32 |
+| `src/fp8MatrixMultiplication.cu` | Naive FP8 GEMM (E4M3 + E5M2, per-tensor + per-row/col scaling) |
+| `src/compareMatrixMultiplication.cu` | Runs FP32/FP16/WMMA kernels, prints accuracy vs FP32 |
+| `include/fp8_utils.cuh` | Shared FP8 quantization utilities (templated on FP8 type) |
