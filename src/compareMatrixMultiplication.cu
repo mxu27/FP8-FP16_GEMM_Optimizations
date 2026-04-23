@@ -3,6 +3,7 @@
 #include <cuda_fp8.h>
 #include <mma.h>
 #include <fp8_utils.cuh>
+#include <fp8_cublaslt.cuh>
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
@@ -313,13 +314,15 @@ int main(int argc, char **argv) {
     int N_pad = (N + 15) / 16 * 16;
 
     // Host output buffers
-    float *hostC_fp32       = (float *)malloc(sizeC * sizeof(float));
-    float *hostC_fp16_naive = (float *)malloc(sizeC * sizeof(float));
-    float *hostC_wmma       = (float *)malloc(sizeC * sizeof(float));
-    float *hostC_e4m3_tensor= (float *)malloc(sizeC * sizeof(float));
-    float *hostC_e5m2_tensor= (float *)malloc(sizeC * sizeof(float));
-    float *hostC_e4m3_rowcol= (float *)malloc(sizeC * sizeof(float));
-    float *hostC_e5m2_rowcol= (float *)malloc(sizeC * sizeof(float));
+    float *hostC_fp32            = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_fp16_naive      = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_wmma            = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e4m3_tensor     = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e5m2_tensor     = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e4m3_rowcol     = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e5m2_rowcol     = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e4m3_cublaslt   = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e5m2_cublaslt   = (float *)malloc(sizeC * sizeof(float));
 
     // GPU buffers for FP32 inputs (shared across all kernels)
     gpuTKTime_start(GPU, "Allocating GPU memory");
@@ -348,11 +351,15 @@ int main(int argc, char **argv) {
     gpuTKCheck(cudaMemcpy(deviceB_fp32, hostB, numBRows * numBColumns * sizeof(float), cudaMemcpyHostToDevice));
     gpuTKTime_stop(GPU, "Copying input memory to GPU");
 
+    // cuBLASLt handle (shared across FP8 tensor core runs)
+    cublasLtHandle_t lt_handle;
+    cublasLtCreate(&lt_handle);
+
     cudaEvent_t ev_start, ev_stop;
     cudaEventCreate(&ev_start);
     cudaEventCreate(&ev_stop);
     float ms = 0;
-    double times[7] = {0};
+    double times[9] = {0};
 
     // --- FP32 GEMM ---
     {
@@ -416,41 +423,58 @@ int main(int argc, char **argv) {
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
 
-    // --- FP8 variants (each allocates/frees its own device buffers) ---
+    // --- FP8 naive variants (each allocates/frees its own device buffers) ---
     if (runFP8PerTensor<__nv_fp8_e4m3>(deviceA_fp32, deviceB_fp32, hostC_e4m3_tensor, M, K, N, &times[3]) != 0) return -1;
     if (runFP8PerTensor<__nv_fp8_e5m2>(deviceA_fp32, deviceB_fp32, hostC_e5m2_tensor, M, K, N, &times[4]) != 0) return -1;
     if (runFP8PerRowCol<__nv_fp8_e4m3>(deviceA_fp32, deviceB_fp32, hostC_e4m3_rowcol, M, K, N, &times[5]) != 0) return -1;
     if (runFP8PerRowCol<__nv_fp8_e5m2>(deviceA_fp32, deviceB_fp32, hostC_e5m2_rowcol, M, K, N, &times[6]) != 0) return -1;
 
+    // --- FP8 cuBLASLt tensor core variants ---
+    runCublasLtFP8(lt_handle, deviceA_fp32, deviceB_fp32, hostC_e4m3_cublaslt, M, K, N, CUDA_R_8F_E4M3, &times[7]);
+    runCublasLtFP8(lt_handle, deviceA_fp32, deviceB_fp32, hostC_e5m2_cublaslt, M, K, N, CUDA_R_8F_E5M2, &times[8]);
+
     // --- Error metrics ---
-    float relL2[7], maxAbs[7];
+    float relL2[9], maxAbs[9];
     relL2[0] = 0.0f; maxAbs[0] = 0.0f;
-    computeErrorMetrics(hostC_fp32, hostC_fp16_naive, sizeC, &relL2[1], &maxAbs[1]);
-    computeErrorMetrics(hostC_fp32, hostC_wmma,       sizeC, &relL2[2], &maxAbs[2]);
-    computeErrorMetrics(hostC_fp32, hostC_e4m3_tensor,sizeC, &relL2[3], &maxAbs[3]);
-    computeErrorMetrics(hostC_fp32, hostC_e5m2_tensor,sizeC, &relL2[4], &maxAbs[4]);
-    computeErrorMetrics(hostC_fp32, hostC_e4m3_rowcol,sizeC, &relL2[5], &maxAbs[5]);
-    computeErrorMetrics(hostC_fp32, hostC_e5m2_rowcol,sizeC, &relL2[6], &maxAbs[6]);
+    computeErrorMetrics(hostC_fp32, hostC_fp16_naive,    sizeC, &relL2[1], &maxAbs[1]);
+    computeErrorMetrics(hostC_fp32, hostC_wmma,          sizeC, &relL2[2], &maxAbs[2]);
+    computeErrorMetrics(hostC_fp32, hostC_e4m3_tensor,   sizeC, &relL2[3], &maxAbs[3]);
+    computeErrorMetrics(hostC_fp32, hostC_e5m2_tensor,   sizeC, &relL2[4], &maxAbs[4]);
+    computeErrorMetrics(hostC_fp32, hostC_e4m3_rowcol,   sizeC, &relL2[5], &maxAbs[5]);
+    computeErrorMetrics(hostC_fp32, hostC_e5m2_rowcol,   sizeC, &relL2[6], &maxAbs[6]);
+    if (times[7] >= 0)
+        computeErrorMetrics(hostC_fp32, hostC_e4m3_cublaslt, sizeC, &relL2[7], &maxAbs[7]);
+    else { relL2[7] = -1.0f; maxAbs[7] = -1.0f; }
+    if (times[8] >= 0)
+        computeErrorMetrics(hostC_fp32, hostC_e5m2_cublaslt, sizeC, &relL2[8], &maxAbs[8]);
+    else { relL2[8] = -1.0f; maxAbs[8] = -1.0f; }
 
     // --- Print benchmark table ---
     printf("\n=== GEMM Benchmark: %dx%d x %dx%d ===\n", M, K, K, N);
-    printf("%-26s  %10s  %10s  %10s\n", "Kernel", "Time (ms)", "Rel L2", "Max Abs");
-    printf("%-26s  %10s  %10s  %10s\n", "------", "---------", "------", "-------");
+    printf("%-30s  %10s  %10s  %10s\n", "Kernel", "Time (ms)", "Rel L2", "Max Abs");
+    printf("%-30s  %10s  %10s  %10s\n", "------", "---------", "------", "-------");
 
-    const char* labels[7] = {
+    const char* labels[9] = {
         "FP32 naive",
         "FP16 naive",
-        "FP16 WMMA",
-        "FP8 E4M3 per-tensor",
-        "FP8 E5M2 per-tensor",
-        "FP8 E4M3 per-row/col",
-        "FP8 E5M2 per-row/col"
+        "FP16 WMMA TC",
+        "FP8 E4M3 naive per-tensor",
+        "FP8 E5M2 naive per-tensor",
+        "FP8 E4M3 naive per-row/col",
+        "FP8 E5M2 naive per-row/col",
+        "FP8 E4M3 cuBLASLt TC",
+        "FP8 E5M2 cuBLASLt TC"
     };
-    for (int i = 0; i < 7; i++) {
-        printf("%-26s  %10.4f  %10.6f  %10.6f\n",
-               labels[i], times[i], relL2[i], maxAbs[i]);
+    for (int i = 0; i < 9; i++) {
+        if (times[i] < 0)
+            printf("%-30s  %10s  %10s  %10s\n", labels[i], "N/A", "N/A", "N/A");
+        else
+            printf("%-30s  %10.4f  %10.6f  %10.6f\n",
+                   labels[i], times[i], relL2[i], maxAbs[i]);
     }
     printf("\n");
+
+    cublasLtDestroy(lt_handle);
 
     // Free GPU memory
     gpuTKCheck(cudaFree(deviceA_fp32));
@@ -472,6 +496,8 @@ int main(int argc, char **argv) {
     free(hostC_e5m2_tensor);
     free(hostC_e4m3_rowcol);
     free(hostC_e5m2_rowcol);
+    free(hostC_e4m3_cublaslt);
+    free(hostC_e5m2_cublaslt);
 
     return 0;
 }
