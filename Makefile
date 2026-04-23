@@ -3,7 +3,7 @@ NVCCFLAGS   := -std=c++14 -O2 -arch=native
 
 GPUTK_DIR   := ./libgputk
 LIBS        := -L$(GPUTK_DIR) -lgputk -Xlinker -rpath -Xlinker $(shell pwd)/libgputk
-INCLUDES    := -I$(GPUTK_DIR)
+INCLUDES    := -I$(GPUTK_DIR) -I./include
 LIBS        := -L$(GPUTK_DIR)/lib -lgputk
 LIBS_FP8    := $(LIBS) -lcublasLt -lcublas
 
@@ -24,7 +24,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/compareMatrixMultiplication: $(SRC_DIR)/compareMatrixMultiplication.cu
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS_FP8)
 
-$(BUILD_DIR)/fp8Quantization: $(SRC_DIR)/fp8Quantization.cu
+$(BUILD_DIR)/fp8MatrixMultiplication: $(SRC_DIR)/fp8MatrixMultiplication.cu
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
 
 $(BUILD_DIR)/%: $(SRC_DIR)/%.cu

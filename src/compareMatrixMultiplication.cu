@@ -1,6 +1,8 @@
 #include <gputk.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
+#include <fp8_utils.cuh>
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
@@ -10,6 +12,7 @@ using namespace nvcuda;
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
+#define BLOCK_SIZE 256
 
 #define gpuTKCheck(stmt)                                                  \
   do {                                                                    \
@@ -20,6 +23,24 @@ using namespace nvcuda;
       return -1;                                                          \
     }                                                                     \
   } while (0)
+
+// ─── FP32 kernel ─────────────────────────────────────────────────────────────
+
+__global__ void matrixMultiplyFP32(
+    const float* A, const float* B, float* C,
+    int M, int K, int N)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++)
+            sum += A[row * K + k] * B[k * N + col];
+        C[row * N + col] = sum;
+    }
+}
+
+// ─── FP16 kernels ─────────────────────────────────────────────────────────────
 
 __global__ void convertFP32ToFP16(
     const float* src, half* dst, int srcRows, int srcCols)
@@ -40,20 +61,6 @@ __global__ void convertAndPadFP32ToFP16(
         dst[row * dstCols + col] = __float2half(src[row * srcCols + col]);
 }
 
-__global__ void matrixMultiplyFP32(
-    const float* A, const float* B, float* C,
-    int M, int K, int N)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int k = 0; k < K; k++)
-            sum += A[row * K + k] * B[k * N + col];
-        C[row * N + col] = sum;
-    }
-}
-
 __global__ void matrixMultiplyFP16Naive(
     const half* A, const half* B, float* C,
     int M, int K, int N)
@@ -68,7 +75,6 @@ __global__ void matrixMultiplyFP16Naive(
     }
 }
 
-// One warp (32 threads) per block, each computing one 16x16 output tile.
 __global__ void matrixMultiplyWMMA(
     const half* __restrict__ A,
     const half* __restrict__ B,
@@ -93,6 +99,175 @@ __global__ void matrixMultiplyWMMA(
     wmma::store_matrix_sync(C + warpM * WMMA_M * N + warpN * WMMA_N, c_frag, N, wmma::mem_row_major);
 }
 
+// ─── FP8 GEMM kernels ────────────────────────────────────────────────────────
+
+template <typename FP8>
+__global__ void matrixMultiplyFP8PerTensor(
+    const FP8* __restrict__ A,
+    const FP8* __restrict__ B,
+    float* __restrict__ C,
+    float invScaleA, float invScaleB,
+    int M, int K, int N)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++)
+            sum += (float)A[row * K + k] * (float)B[k * N + col];
+        C[row * N + col] = sum * invScaleA * invScaleB;
+    }
+}
+
+template <typename FP8>
+__global__ void matrixMultiplyFP8PerRowCol(
+    const FP8*   __restrict__ A,
+    const FP8*   __restrict__ B,
+    float*       __restrict__ C,
+    const float* __restrict__ invScaleA,
+    const float* __restrict__ invScaleB,
+    int M, int K, int N)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++)
+            sum += (float)A[row * K + k] * (float)B[k * N + col];
+        C[row * N + col] = sum * invScaleA[row] * invScaleB[col];
+    }
+}
+
+// ─── FP8 pipeline helpers ────────────────────────────────────────────────────
+
+template <typename FP8>
+int runFP8PerTensor(const float* dA_fp32, const float* dB_fp32,
+                    float* hostC, int M, int K, int N,
+                    double* elapsed_ms)
+{
+    int sizeA = M * K, sizeB = K * N, sizeC = M * N;
+    int threads = BLOCK_SIZE;
+
+    FP8   *dA_fp8, *dB_fp8;
+    float *dC, *dMaxA, *dMaxB;
+
+    gpuTKCheck(cudaMalloc(&dA_fp8, sizeA * sizeof(FP8)));
+    gpuTKCheck(cudaMalloc(&dB_fp8, sizeB * sizeof(FP8)));
+    gpuTKCheck(cudaMalloc(&dC,     sizeC * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&dMaxA,  sizeof(float)));
+    gpuTKCheck(cudaMalloc(&dMaxB,  sizeof(float)));
+    gpuTKCheck(cudaMemset(dMaxA, 0, sizeof(float)));
+    gpuTKCheck(cudaMemset(dMaxB, 0, sizeof(float)));
+
+    findMaxAbsKernel<<<min(256, (sizeA + threads - 1) / threads), threads, threads * sizeof(float)>>>(dA_fp32, dMaxA, sizeA);
+    findMaxAbsKernel<<<min(256, (sizeB + threads - 1) / threads), threads, threads * sizeof(float)>>>(dB_fp32, dMaxB, sizeB);
+    gpuTKCheck(cudaDeviceSynchronize());
+
+    float hMaxA, hMaxB;
+    gpuTKCheck(cudaMemcpy(&hMaxA, dMaxA, sizeof(float), cudaMemcpyDeviceToHost));
+    gpuTKCheck(cudaMemcpy(&hMaxB, dMaxB, sizeof(float), cudaMemcpyDeviceToHost));
+
+    float scaleA = computeQuantScale<FP8>(hMaxA);
+    float scaleB = computeQuantScale<FP8>(hMaxB);
+
+    quantizeFP32toFP8<FP8><<<(sizeA + threads - 1) / threads, threads>>>(dA_fp32, dA_fp8, scaleA, sizeA);
+    quantizeFP32toFP8<FP8><<<(sizeB + threads - 1) / threads, threads>>>(dB_fp32, dB_fp8, scaleB, sizeB);
+    gpuTKCheck(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (M + 15) / 16);
+    cudaEventRecord(start);
+    matrixMultiplyFP8PerTensor<FP8><<<grid, block>>>(dA_fp8, dB_fp8, dC, 1.0f / scaleA, 1.0f / scaleB, M, K, N);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    *elapsed_ms = (double)ms;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    gpuTKCheck(cudaMemcpy(hostC, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+
+    gpuTKCheck(cudaFree(dA_fp8));
+    gpuTKCheck(cudaFree(dB_fp8));
+    gpuTKCheck(cudaFree(dC));
+    gpuTKCheck(cudaFree(dMaxA));
+    gpuTKCheck(cudaFree(dMaxB));
+    return 0;
+}
+
+template <typename FP8>
+int runFP8PerRowCol(const float* dA_fp32, const float* dB_fp32,
+                    float* hostC, int M, int K, int N,
+                    double* elapsed_ms)
+{
+    int sizeA = M * K, sizeB = K * N, sizeC = M * N;
+    int threads = BLOCK_SIZE;
+
+    FP8   *dA_fp8, *dB_fp8;
+    float *dC, *dScalesA, *dScalesB;
+
+    gpuTKCheck(cudaMalloc(&dA_fp8,   sizeA * sizeof(FP8)));
+    gpuTKCheck(cudaMalloc(&dB_fp8,   sizeB * sizeof(FP8)));
+    gpuTKCheck(cudaMalloc(&dC,       sizeC * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&dScalesA, M * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&dScalesB, N * sizeof(float)));
+
+    findMaxAbsPerRowKernel<<<M, threads, threads * sizeof(float)>>>(dA_fp32, dScalesA, M, K);
+    findMaxAbsPerColKernel<<<N, threads, threads * sizeof(float)>>>(dB_fp32, dScalesB, K, N);
+    gpuTKCheck(cudaDeviceSynchronize());
+
+    maxAbsToScales<FP8><<<(M + threads - 1) / threads, threads>>>(dScalesA, M);
+    maxAbsToScales<FP8><<<(N + threads - 1) / threads, threads>>>(dScalesB, N);
+    gpuTKCheck(cudaDeviceSynchronize());
+
+    {
+        dim3 block(16, 16);
+        dim3 gridA((K + 15) / 16, (M + 15) / 16);
+        dim3 gridB((N + 15) / 16, (K + 15) / 16);
+        quantizeFP32toFP8PerRow<FP8><<<gridA, block>>>(dA_fp32, dA_fp8, dScalesA, M, K);
+        quantizeFP32toFP8PerCol<FP8><<<gridB, block>>>(dB_fp32, dB_fp8, dScalesB, K, N);
+    }
+    gpuTKCheck(cudaDeviceSynchronize());
+
+    invertScales<<<(M + threads - 1) / threads, threads>>>(dScalesA, M);
+    invertScales<<<(N + threads - 1) / threads, threads>>>(dScalesB, N);
+    gpuTKCheck(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (M + 15) / 16);
+    cudaEventRecord(start);
+    matrixMultiplyFP8PerRowCol<FP8><<<grid, block>>>(dA_fp8, dB_fp8, dC, dScalesA, dScalesB, M, K, N);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    *elapsed_ms = (double)ms;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    gpuTKCheck(cudaMemcpy(hostC, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+
+    gpuTKCheck(cudaFree(dA_fp8));
+    gpuTKCheck(cudaFree(dB_fp8));
+    gpuTKCheck(cudaFree(dC));
+    gpuTKCheck(cudaFree(dScalesA));
+    gpuTKCheck(cudaFree(dScalesB));
+    return 0;
+}
+
+// ─── Error metrics ───────────────────────────────────────────────────────────
+
 void computeErrorMetrics(
     const float* ref, const float* result, int N,
     float* relL2, float* maxAbs)
@@ -108,18 +283,13 @@ void computeErrorMetrics(
     *relL2 = (float)sqrt(l2_num / (l2_den + 1e-10));
 }
 
+// ─── main ────────────────────────────────────────────────────────────────────
+
 int main(int argc, char **argv) {
     gpuTKArg_t args;
 
     float *hostA, *hostB;
-    float *hostC_fp32, *hostC_fp16_naive, *hostC_wmma;
-
     float *deviceA_fp32, *deviceB_fp32;
-    float *deviceC_fp32, *deviceC_fp16_naive;
-    half  *deviceA_half, *deviceB_half;
-    half  *deviceA_half_pad, *deviceB_half_pad;
-    float *deviceC_wmma_pad;
-
     int numARows, numAColumns, numBRows, numBColumns;
     int numCRows, numCColumns;
 
@@ -130,31 +300,47 @@ int main(int argc, char **argv) {
     hostB = (float *)gpuTKImport(gpuTKArg_getInputFile(args, 1), &numBRows, &numBColumns);
     numCRows    = numARows;
     numCColumns = numBColumns;
-    hostC_fp32       = (float *)malloc(numCRows * numCColumns * sizeof(float));
-    hostC_fp16_naive = (float *)malloc(numCRows * numCColumns * sizeof(float));
-    hostC_wmma       = (float *)malloc(numCRows * numCColumns * sizeof(float));
     gpuTKTime_stop(Generic, "Importing data and creating memory on host");
 
     gpuTKLog(TRACE, "A: ", numARows, " x ", numAColumns);
     gpuTKLog(TRACE, "B: ", numBRows, " x ", numBColumns);
 
-    int M_pad = (numARows    + 15) / 16 * 16;
-    int K_pad = (numAColumns + 15) / 16 * 16;
-    int N_pad = (numBColumns + 15) / 16 * 16;
+    int M = numARows, K = numAColumns, N = numBColumns;
+    int sizeC = numCRows * numCColumns;
 
+    int M_pad = (M + 15) / 16 * 16;
+    int K_pad = (K + 15) / 16 * 16;
+    int N_pad = (N + 15) / 16 * 16;
+
+    // Host output buffers
+    float *hostC_fp32       = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_fp16_naive = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_wmma       = (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e4m3_tensor= (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e5m2_tensor= (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e4m3_rowcol= (float *)malloc(sizeC * sizeof(float));
+    float *hostC_e5m2_rowcol= (float *)malloc(sizeC * sizeof(float));
+
+    // GPU buffers for FP32 inputs (shared across all kernels)
     gpuTKTime_start(GPU, "Allocating GPU memory");
-    gpuTKCheck(cudaMalloc(&deviceA_fp32,      numARows * numAColumns * sizeof(float)));
-    gpuTKCheck(cudaMalloc(&deviceB_fp32,      numBRows * numBColumns * sizeof(float)));
-    gpuTKCheck(cudaMalloc(&deviceC_fp32,      numCRows * numCColumns * sizeof(float)));
-    gpuTKCheck(cudaMalloc(&deviceA_half,      numARows * numAColumns * sizeof(half)));
-    gpuTKCheck(cudaMalloc(&deviceB_half,      numBRows * numBColumns * sizeof(half)));
-    gpuTKCheck(cudaMalloc(&deviceC_fp16_naive,numCRows * numCColumns * sizeof(float)));
-    gpuTKCheck(cudaMalloc(&deviceA_half_pad,  M_pad * K_pad * sizeof(half)));
-    gpuTKCheck(cudaMalloc(&deviceB_half_pad,  K_pad * N_pad * sizeof(half)));
-    gpuTKCheck(cudaMalloc(&deviceC_wmma_pad,  M_pad * N_pad * sizeof(float)));
-    gpuTKCheck(cudaMemset(deviceA_half_pad, 0, M_pad * K_pad * sizeof(half)));
-    gpuTKCheck(cudaMemset(deviceB_half_pad, 0, K_pad * N_pad * sizeof(half)));
-    gpuTKCheck(cudaMemset(deviceC_wmma_pad, 0, M_pad * N_pad * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&deviceA_fp32, numARows * numAColumns * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&deviceB_fp32, numBRows * numBColumns * sizeof(float)));
+
+    float *deviceC_fp32, *deviceC_fp16_naive;
+    half  *deviceA_half, *deviceB_half;
+    half  *deviceA_half_pad, *deviceB_half_pad;
+    float *deviceC_wmma_pad;
+
+    gpuTKCheck(cudaMalloc(&deviceC_fp32,       sizeC * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&deviceA_half,        numARows * numAColumns * sizeof(half)));
+    gpuTKCheck(cudaMalloc(&deviceB_half,        numBRows * numBColumns * sizeof(half)));
+    gpuTKCheck(cudaMalloc(&deviceC_fp16_naive,  sizeC * sizeof(float)));
+    gpuTKCheck(cudaMalloc(&deviceA_half_pad,    M_pad * K_pad * sizeof(half)));
+    gpuTKCheck(cudaMalloc(&deviceB_half_pad,    K_pad * N_pad * sizeof(half)));
+    gpuTKCheck(cudaMalloc(&deviceC_wmma_pad,    M_pad * N_pad * sizeof(float)));
+    gpuTKCheck(cudaMemset(deviceA_half_pad, 0,  M_pad * K_pad * sizeof(half)));
+    gpuTKCheck(cudaMemset(deviceB_half_pad, 0,  K_pad * N_pad * sizeof(half)));
+    gpuTKCheck(cudaMemset(deviceC_wmma_pad, 0,  M_pad * N_pad * sizeof(float)));
     gpuTKTime_stop(GPU, "Allocating GPU memory");
 
     gpuTKTime_start(GPU, "Copying input memory to GPU");
@@ -162,63 +348,61 @@ int main(int argc, char **argv) {
     gpuTKCheck(cudaMemcpy(deviceB_fp32, hostB, numBRows * numBColumns * sizeof(float), cudaMemcpyHostToDevice));
     gpuTKTime_stop(GPU, "Copying input memory to GPU");
 
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+    float ms = 0;
+    double times[7] = {0};
+
     // --- FP32 GEMM ---
     {
         dim3 block(16, 16);
-        dim3 grid((numCColumns + 15) / 16, (numCRows + 15) / 16);
-        gpuTKTime_start(Compute, "FP32 GEMM");
-        matrixMultiplyFP32<<<grid, block>>>(deviceA_fp32, deviceB_fp32, deviceC_fp32,
-                                            numARows, numAColumns, numBColumns);
-        cudaDeviceSynchronize();
-        gpuTKTime_stop(Compute, "FP32 GEMM");
+        dim3 grid((N + 15) / 16, (M + 15) / 16);
+        cudaEventRecord(ev_start);
+        matrixMultiplyFP32<<<grid, block>>>(deviceA_fp32, deviceB_fp32, deviceC_fp32, M, K, N);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        times[0] = ms;
     }
-    gpuTKCheck(cudaMemcpy(hostC_fp32, deviceC_fp32, numCRows * numCColumns * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // --- Convert for naive FP16 (no padding needed) ---
-    {
-        dim3 block(16, 16);
-        dim3 gridA((numAColumns + 15) / 16, (numARows + 15) / 16);
-        dim3 gridB((numBColumns + 15) / 16, (numBRows + 15) / 16);
-        gpuTKTime_start(Compute, "FP32 to FP16 conversion (naive)");
-        convertFP32ToFP16<<<gridA, block>>>(deviceA_fp32, deviceA_half, numARows, numAColumns);
-        convertFP32ToFP16<<<gridB, block>>>(deviceB_fp32, deviceB_half, numBRows, numBColumns);
-        cudaDeviceSynchronize();
-        gpuTKTime_stop(Compute, "FP32 to FP16 conversion (naive)");
-    }
+    gpuTKCheck(cudaMemcpy(hostC_fp32, deviceC_fp32, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
 
     // --- Naive FP16 GEMM ---
     {
         dim3 block(16, 16);
-        dim3 grid((numCColumns + 15) / 16, (numCRows + 15) / 16);
-        gpuTKTime_start(Compute, "Naive FP16 GEMM");
-        matrixMultiplyFP16Naive<<<grid, block>>>(deviceA_half, deviceB_half, deviceC_fp16_naive,
-                                                 numARows, numAColumns, numBColumns);
+        dim3 gridA((K + 15) / 16, (M + 15) / 16);
+        dim3 gridB((N + 15) / 16, (K + 15) / 16);
+        convertFP32ToFP16<<<gridA, block>>>(deviceA_fp32, deviceA_half, M, K);
+        convertFP32ToFP16<<<gridB, block>>>(deviceB_fp32, deviceB_half, K, N);
         cudaDeviceSynchronize();
-        gpuTKTime_stop(Compute, "Naive FP16 GEMM");
-    }
-    gpuTKCheck(cudaMemcpy(hostC_fp16_naive, deviceC_fp16_naive, numCRows * numCColumns * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // --- Convert for WMMA (padded) ---
-    {
-        dim3 block(16, 16);
-        dim3 gridA((numAColumns + 15) / 16, (numARows + 15) / 16);
-        dim3 gridB((numBColumns + 15) / 16, (numBRows + 15) / 16);
-        gpuTKTime_start(Compute, "FP32 to FP16 conversion (WMMA padded)");
-        convertAndPadFP32ToFP16<<<gridA, block>>>(deviceA_fp32, deviceA_half_pad, numARows, numAColumns, K_pad);
-        convertAndPadFP32ToFP16<<<gridB, block>>>(deviceB_fp32, deviceB_half_pad, numBRows, numBColumns, N_pad);
-        cudaDeviceSynchronize();
-        gpuTKTime_stop(Compute, "FP32 to FP16 conversion (WMMA padded)");
+        dim3 grid((N + 15) / 16, (M + 15) / 16);
+        cudaEventRecord(ev_start);
+        matrixMultiplyFP16Naive<<<grid, block>>>(deviceA_half, deviceB_half, deviceC_fp16_naive, M, K, N);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        times[1] = ms;
     }
+    gpuTKCheck(cudaMemcpy(hostC_fp16_naive, deviceC_fp16_naive, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
 
     // --- WMMA Tensor Core GEMM ---
     {
-        dim3 grid(N_pad / WMMA_N, M_pad / WMMA_M);
-        dim3 block(32);
-        gpuTKTime_start(Compute, "WMMA Tensor Core GEMM");
-        matrixMultiplyWMMA<<<grid, block>>>(deviceA_half_pad, deviceB_half_pad, deviceC_wmma_pad,
-                                            M_pad, K_pad, N_pad);
+        dim3 block(16, 16);
+        dim3 gridA((K + 15) / 16, (M + 15) / 16);
+        dim3 gridB((N + 15) / 16, (K + 15) / 16);
+        convertAndPadFP32ToFP16<<<gridA, block>>>(deviceA_fp32, deviceA_half_pad, M, K, K_pad);
+        convertAndPadFP32ToFP16<<<gridB, block>>>(deviceB_fp32, deviceB_half_pad, K, N, N_pad);
         cudaDeviceSynchronize();
-        gpuTKTime_stop(Compute, "WMMA Tensor Core GEMM");
+
+        dim3 grid(N_pad / WMMA_N, M_pad / WMMA_M);
+        dim3 warp_block(32);
+        cudaEventRecord(ev_start);
+        matrixMultiplyWMMA<<<grid, warp_block>>>(deviceA_half_pad, deviceB_half_pad, deviceC_wmma_pad, M_pad, K_pad, N_pad);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        times[2] = ms;
     }
     gpuTKCheck(cudaMemcpy2D(
         hostC_wmma,                      // dst
@@ -229,19 +413,46 @@ int main(int argc, char **argv) {
         numCRows,                        // height
         cudaMemcpyDeviceToHost));
 
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+
+    // --- FP8 variants (each allocates/frees its own device buffers) ---
+    if (runFP8PerTensor<__nv_fp8_e4m3>(deviceA_fp32, deviceB_fp32, hostC_e4m3_tensor, M, K, N, &times[3]) != 0) return -1;
+    if (runFP8PerTensor<__nv_fp8_e5m2>(deviceA_fp32, deviceB_fp32, hostC_e5m2_tensor, M, K, N, &times[4]) != 0) return -1;
+    if (runFP8PerRowCol<__nv_fp8_e4m3>(deviceA_fp32, deviceB_fp32, hostC_e4m3_rowcol, M, K, N, &times[5]) != 0) return -1;
+    if (runFP8PerRowCol<__nv_fp8_e5m2>(deviceA_fp32, deviceB_fp32, hostC_e5m2_rowcol, M, K, N, &times[6]) != 0) return -1;
+
     // --- Error metrics ---
-    float relL2, maxAbs;
-    printf("\n=== Accuracy vs FP32 reference ===\n");
+    float relL2[7], maxAbs[7];
+    relL2[0] = 0.0f; maxAbs[0] = 0.0f;
+    computeErrorMetrics(hostC_fp32, hostC_fp16_naive, sizeC, &relL2[1], &maxAbs[1]);
+    computeErrorMetrics(hostC_fp32, hostC_wmma,       sizeC, &relL2[2], &maxAbs[2]);
+    computeErrorMetrics(hostC_fp32, hostC_e4m3_tensor,sizeC, &relL2[3], &maxAbs[3]);
+    computeErrorMetrics(hostC_fp32, hostC_e5m2_tensor,sizeC, &relL2[4], &maxAbs[4]);
+    computeErrorMetrics(hostC_fp32, hostC_e4m3_rowcol,sizeC, &relL2[5], &maxAbs[5]);
+    computeErrorMetrics(hostC_fp32, hostC_e5m2_rowcol,sizeC, &relL2[6], &maxAbs[6]);
 
-    computeErrorMetrics(hostC_fp32, hostC_fp16_naive, numCRows * numCColumns, &relL2, &maxAbs);
-    printf("[Naive FP16]  Relative L2 error: %.6f  Max abs error: %.6f\n", relL2, maxAbs);
+    // --- Print benchmark table ---
+    printf("\n=== GEMM Benchmark: %dx%d x %dx%d ===\n", M, K, K, N);
+    printf("%-26s  %10s  %10s  %10s\n", "Kernel", "Time (ms)", "Rel L2", "Max Abs");
+    printf("%-26s  %10s  %10s  %10s\n", "------", "---------", "------", "-------");
 
-    computeErrorMetrics(hostC_fp32, hostC_wmma, numCRows * numCColumns, &relL2, &maxAbs);
-    printf("[WMMA TC]     Relative L2 error: %.6f  Max abs error: %.6f\n", relL2, maxAbs);
+    const char* labels[7] = {
+        "FP32 naive",
+        "FP16 naive",
+        "FP16 WMMA",
+        "FP8 E4M3 per-tensor",
+        "FP8 E5M2 per-tensor",
+        "FP8 E4M3 per-row/col",
+        "FP8 E5M2 per-row/col"
+    };
+    for (int i = 0; i < 7; i++) {
+        printf("%-26s  %10.4f  %10.6f  %10.6f\n",
+               labels[i], times[i], relL2[i], maxAbs[i]);
+    }
+    printf("\n");
 
-    printf("===================================\n\n");
-
-    gpuTKTime_start(GPU, "Freeing GPU memory");
+    // Free GPU memory
     gpuTKCheck(cudaFree(deviceA_fp32));
     gpuTKCheck(cudaFree(deviceB_fp32));
     gpuTKCheck(cudaFree(deviceC_fp32));
@@ -251,13 +462,16 @@ int main(int argc, char **argv) {
     gpuTKCheck(cudaFree(deviceA_half_pad));
     gpuTKCheck(cudaFree(deviceB_half_pad));
     gpuTKCheck(cudaFree(deviceC_wmma_pad));
-    gpuTKTime_stop(GPU, "Freeing GPU memory");
 
     free(hostA);
     free(hostB);
     free(hostC_fp32);
     free(hostC_fp16_naive);
     free(hostC_wmma);
+    free(hostC_e4m3_tensor);
+    free(hostC_e5m2_tensor);
+    free(hostC_e4m3_rowcol);
+    free(hostC_e5m2_rowcol);
 
     return 0;
 }
