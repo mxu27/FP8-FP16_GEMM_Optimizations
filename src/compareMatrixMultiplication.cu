@@ -430,8 +430,10 @@ int main(int argc, char **argv) {
     if (runFP8PerRowCol<__nv_fp8_e5m2>(deviceA_fp32, deviceB_fp32, hostC_e5m2_rowcol, M, K, N, &times[6]) != 0) return -1;
 
     // --- FP8 cuBLASLt tensor core variants ---
-    runCublasLtFP8(lt_handle, deviceA_fp32, deviceB_fp32, hostC_e4m3_cublaslt, M, K, N, CUDA_R_8F_E4M3, &times[7]);
-    runCublasLtFP8(lt_handle, deviceA_fp32, deviceB_fp32, hostC_e5m2_cublaslt, M, K, N, CUDA_R_8F_E5M2, &times[8]);
+    // E4M3 x E4M3: both operands E4M3 (highest precision FP8 combination)
+    runCublasLtFP8(lt_handle, deviceA_fp32, deviceB_fp32, hostC_e4m3_cublaslt, M, K, N, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, &times[7]);
+    // E4M3 x E5M2: mixed (A=E4M3, B=E5M2) — only mixed combo supported by cuBLASLt
+    runCublasLtFP8(lt_handle, deviceA_fp32, deviceB_fp32, hostC_e5m2_cublaslt, M, K, N, CUDA_R_8F_E4M3, CUDA_R_8F_E5M2, &times[8]);
 
     // --- Error metrics ---
     float relL2[9], maxAbs[9];
@@ -462,8 +464,8 @@ int main(int argc, char **argv) {
         "FP8 E5M2 naive per-tensor",
         "FP8 E4M3 naive per-row/col",
         "FP8 E5M2 naive per-row/col",
-        "FP8 E4M3 cuBLASLt TC",
-        "FP8 E5M2 cuBLASLt TC"
+        "FP8 E4M3xE4M3 cuBLASLt TC",
+        "FP8 E4M3xE5M2 cuBLASLt TC"
     };
     for (int i = 0; i < 9; i++) {
         if (times[i] < 0)
