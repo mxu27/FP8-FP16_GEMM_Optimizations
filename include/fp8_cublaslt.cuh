@@ -5,6 +5,13 @@
 #include <fp8_utils.cuh>
 #include <stdio.h>
 
+__global__ static void applyDeqScale(float* C, float invScaleA, float invScaleB, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N)
+        C[i] *= invScaleA * invScaleB;
+}
+
 static int runCublasLtFP8(
     cublasLtHandle_t lt_handle,
     const float* dA_fp32, const float* dB_fp32,
@@ -37,17 +44,6 @@ static int runCublasLtFP8(
                                               : computeQuantScale<__nv_fp8_e5m2>(hMaxA);
     float scaleB = (typeB == CUDA_R_8F_E4M3) ? computeQuantScale<__nv_fp8_e4m3>(hMaxB)
                                               : computeQuantScale<__nv_fp8_e5m2>(hMaxB);
-    float invScaleA = 1.0f / scaleA;
-    float invScaleB = 1.0f / scaleB;
-
-    float *dScaleA, *dScaleB, *dScaleD;
-    cudaMalloc(&dScaleA, sizeof(float));
-    cudaMalloc(&dScaleB, sizeof(float));
-    cudaMalloc(&dScaleD, sizeof(float));
-    float one = 1.0f;
-    cudaMemcpy(dScaleA, &invScaleA, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dScaleB, &invScaleB, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dScaleD, &one,       sizeof(float), cudaMemcpyHostToDevice);
 
     void *dA_fp8 = nullptr, *dB_fp8 = nullptr;
     cudaMalloc(&dA_fp8, sizeA * sizeof(__nv_fp8_e4m3));
@@ -76,14 +72,23 @@ static int runCublasLtFP8(
 
     cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
 
+    // Use true transposes so A and B are passed in their natural row-major order.
+    // cuBLASLt col-major: C_col = op(A) * op(B)
+    // With CUBLAS_OP_T on both: C_col(M x N) = A^T_col(M x K) * B_col(K x N)
+    // A^T col-major (M x K) = A row-major (M x K), ld = K
+    // B col-major (K x N) = B^T row-major (K x N), ld = K...
+    // Simplest correct setup: TRANSA=T, TRANSB=N
+    // op(A) = A^T where A is stored col-major (K x M) with ld=K => same as row-major A (M x K)
+    // op(B) = B   where B is stored col-major (K x N) with ld=K => same as row-major B^T...
+    // Use the well-known swap trick instead with TRANSA=N, TRANSB=N:
+    // Compute C^T = B * A  in col-major, then C^T col-major = C row-major
     cublasOperation_t op_n = CUBLAS_OP_N;
     cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n));
     cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n));
 
-    cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &dScaleA, sizeof(dScaleA));
-    cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &dScaleB, sizeof(dScaleB));
-    cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &dScaleD, sizeof(dScaleD));
-
+    // No D scale pointer — output is plain FP32, dequant applied manually after
+    // layout_A here = B (col-major N x K, ld=N), layout_B = A (col-major K x M, ld=K)
+    // Result layout_C = col-major N x M (ld=N) = row-major C (M x N)
     cublasLtMatrixLayoutCreate(&layout_A, typeB,      N, K, N);
     cublasLtMatrixLayoutCreate(&layout_B, typeA,      K, M, K);
     cublasLtMatrixLayoutCreate(&layout_C, CUDA_R_32F, N, M, N);
@@ -121,7 +126,6 @@ static int runCublasLtFP8(
         cublasLtMatrixLayoutDestroy(layout_C);
         cublasLtMatmulDescDestroy(matmul_desc);
         cudaFree(dA_fp8); cudaFree(dB_fp8); cudaFree(dC); cudaFree(workspace);
-        cudaFree(dScaleA); cudaFree(dScaleB); cudaFree(dScaleD);
         *elapsed_ms = -1.0;
         return -1;
     }
@@ -152,6 +156,10 @@ static int runCublasLtFP8(
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
 
+    applyDeqScale<<<(sizeC + threads - 1) / threads, threads>>>(
+        dC, 1.0f / scaleA, 1.0f / scaleB, sizeC);
+    cudaDeviceSynchronize();
+
     cudaMemcpy(hostC, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost);
 
     cublasLtMatmulPreferenceDestroy(pref);
@@ -163,8 +171,5 @@ static int runCublasLtFP8(
     cudaFree(dB_fp8);
     cudaFree(dC);
     cudaFree(workspace);
-    cudaFree(dScaleA);
-    cudaFree(dScaleB);
-    cudaFree(dScaleD);
     return 0;
 }
