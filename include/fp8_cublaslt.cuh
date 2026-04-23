@@ -12,6 +12,57 @@ __global__ static void applyDeqScale(float* C, float invScaleA, float invScaleB,
         C[i] *= invScaleA * invScaleB;
 }
 
+static void diagnoseFP8Support(cublasLtHandle_t lt_handle, int M, int K, int N,
+                                cudaDataType_t typeA, cudaDataType_t typeB)
+{
+    fprintf(stderr, "\n--- cuBLASLt FP8 diagnostic (A=%s B=%s) ---\n",
+            typeA == CUDA_R_8F_E4M3 ? "E4M3" : "E5M2",
+            typeB == CUDA_R_8F_E4M3 ? "E4M3" : "E5M2");
+
+    const char* op_names[] = {"N", "T"};
+    cublasOperation_t ops[] = {CUBLAS_OP_N, CUBLAS_OP_T};
+
+    for (int ia = 0; ia < 2; ia++) {
+        for (int ib = 0; ib < 2; ib++) {
+            cublasLtMatmulDesc_t   desc = nullptr;
+            cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+
+            cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &ops[ia], sizeof(ops[ia]));
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &ops[ib], sizeof(ops[ib]));
+
+            int lda = (ops[ia] == CUBLAS_OP_N) ? K : M;
+            int ldb = (ops[ib] == CUBLAS_OP_N) ? N : K;
+
+            cublasLtMatrixLayoutCreate(&la, typeA, (ops[ia] == CUBLAS_OP_N) ? M : K,
+                                                   (ops[ia] == CUBLAS_OP_N) ? K : M, lda);
+            cublasLtMatrixLayoutCreate(&lb, typeB, (ops[ib] == CUBLAS_OP_N) ? K : N,
+                                                   (ops[ib] == CUBLAS_OP_N) ? N : K, ldb);
+            cublasLtMatrixLayoutCreate(&lc, CUDA_R_32F, M, N, M);
+
+            cublasLtMatmulPreference_t pref = nullptr;
+            cublasLtMatmulPreferenceCreate(&pref);
+            size_t ws = 32 * 1024 * 1024;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
+
+            cublasLtMatmulHeuristicResult_t results[4] = {};
+            int nresults = 0;
+            cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+                lt_handle, desc, la, lb, lc, lc, pref, 4, results, &nresults);
+
+            fprintf(stderr, "  transa=%s transb=%s lda=%d ldb=%d => status=%d results=%d\n",
+                    op_names[ia], op_names[ib], lda, ldb, (int)st, nresults);
+
+            cublasLtMatmulPreferenceDestroy(pref);
+            cublasLtMatrixLayoutDestroy(la);
+            cublasLtMatrixLayoutDestroy(lb);
+            cublasLtMatrixLayoutDestroy(lc);
+            cublasLtMatmulDescDestroy(desc);
+        }
+    }
+    fprintf(stderr, "--- end diagnostic ---\n\n");
+}
+
 static int runCublasLtFP8(
     cublasLtHandle_t lt_handle,
     const float* dA_fp32, const float* dB_fp32,
@@ -72,26 +123,23 @@ static int runCublasLtFP8(
 
     cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
 
-    // Use true transposes so A and B are passed in their natural row-major order.
-    // cuBLASLt col-major: C_col = op(A) * op(B)
-    // With CUBLAS_OP_T on both: C_col(M x N) = A^T_col(M x K) * B_col(K x N)
-    // A^T col-major (M x K) = A row-major (M x K), ld = K
-    // B col-major (K x N) = B^T row-major (K x N), ld = K...
-    // Simplest correct setup: TRANSA=T, TRANSB=N
-    // op(A) = A^T where A is stored col-major (K x M) with ld=K => same as row-major A (M x K)
-    // op(B) = B   where B is stored col-major (K x N) with ld=K => same as row-major B^T...
-    // Use the well-known swap trick instead with TRANSA=N, TRANSB=N:
-    // Compute C^T = B * A  in col-major, then C^T col-major = C row-major
+    // Only supported combo on SM 89: transa=T, transb=N
+    // A stored as col-major(K x M) with ld=K, transposed to (M x K) by op=T
+    //   => row-major A(M x K) with ld=K, same memory layout
+    // B stored as col-major(K x N) with ld=K, used as-is by op=N
+    //   => row-major B^T... no: col-major(K x N) ld=K with op=N gives K x N matrix
+    // Result C col-major(M x N) ld=M = row-major C(M x N) ld=M (contiguous)
+    cublasOperation_t op_t = CUBLAS_OP_T;
     cublasOperation_t op_n = CUBLAS_OP_N;
-    cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n));
+    cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t));
     cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n));
 
-    // No D scale pointer — output is plain FP32, dequant applied manually after
-    // layout_A here = B (col-major N x K, ld=N), layout_B = A (col-major K x M, ld=K)
-    // Result layout_C = col-major N x M (ld=N) = row-major C (M x N)
-    cublasLtMatrixLayoutCreate(&layout_A, typeB,      N, K, N);
-    cublasLtMatrixLayoutCreate(&layout_B, typeA,      K, M, K);
-    cublasLtMatrixLayoutCreate(&layout_C, CUDA_R_32F, N, M, N);
+    // layout_A: col-major(K x M) ld=K  ->  after op=T gives (M x K)
+    // layout_B: col-major(K x N) ld=K  ->  after op=N gives (K x N)
+    // layout_C: col-major(M x N) ld=M
+    cublasLtMatrixLayoutCreate(&layout_A, typeA,      K, M, K);
+    cublasLtMatrixLayoutCreate(&layout_B, typeB,      K, N, K);
+    cublasLtMatrixLayoutCreate(&layout_C, CUDA_R_32F, M, N, M);
 
     float *dC = nullptr;
     cudaMalloc(&dC, sizeC * sizeof(float));
@@ -116,10 +164,7 @@ static int runCublasLtFP8(
         pref, 1, &heuristic, &returned_results);
 
     if (heur_status != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
-        fprintf(stderr, "cuBLASLt FP8 (A=%s B=%s): no algorithm found (status=%d, results=%d).\n",
-                typeA == CUDA_R_8F_E4M3 ? "E4M3" : "E5M2",
-                typeB == CUDA_R_8F_E4M3 ? "E4M3" : "E5M2",
-                (int)heur_status, returned_results);
+        diagnoseFP8Support(lt_handle, M, K, N, typeA, typeB);
         cublasLtMatmulPreferenceDestroy(pref);
         cublasLtMatrixLayoutDestroy(layout_A);
         cublasLtMatrixLayoutDestroy(layout_B);
@@ -138,8 +183,8 @@ static int runCublasLtFP8(
     cublasLtMatmul(
         lt_handle, matmul_desc,
         &alpha,
-        dB_fp8, layout_A,
-        dA_fp8, layout_B,
+        dA_fp8, layout_A,
+        dB_fp8, layout_B,
         &beta,
         dC, layout_C,
         dC, layout_C,
